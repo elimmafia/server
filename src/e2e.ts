@@ -1,0 +1,51 @@
+import assert from 'node:assert/strict';
+import { io, type Socket } from 'socket.io-client';
+import type { GameView } from './types.js';
+const URL=process.env.URL??'http://localhost:4000';
+const wait=(ms:number)=>new Promise(r=>setTimeout(r,ms));
+const clients=Array.from({length:4},(_,i)=>({s:io(URL,{transports:['websocket']}), token:`e2e-token-${i}-aaaaaaaaaaaaaaaa`,view:null as GameView|null}));
+const ack=(s:Socket,event:string,...args:unknown[])=>new Promise<any>((resolve,reject)=>s.timeout(5000).emit(event,...args,(e:unknown,r:any)=>e?reject(e):resolve(r)));
+const send=async(i:number,event:string,...args:unknown[])=>{const r=await ack(clients[i].s,event,...args);assert.ok(r.ok,r.error);await wait(30);};
+clients.forEach(c=>c.s.on('state',(v:GameView)=>c.view=v));
+try {
+  await wait(300);
+  const created=await ack(clients[0].s,'room:create',{name:'방장',token:clients[0].token});assert.ok(created.ok);
+  for(let i=1;i<4;i++)await send(i,'room:join',{code:created.code,name:`P${i}`,token:clients[i].token});
+  assert.equal((await ack(clients[1].s,'game:start')).ok,false);
+  await send(0,'room:settings',{mafia:1,police:1,doctor:1});await send(0,'game:start');
+  assert.equal(clients[0].view!.phase,'intro');
+  for(let i=0;i<4;i++)await send(i,'night:next');
+  assert.equal(clients[0].view!.day,2);
+  assert.equal((await ack(clients[1].s,'host:next')).ok,false);
+  await send(0,'host:next');
+  for(let i=0;i<4;i++)await send(i,'vote:cast',null);
+  await wait(2700);assert.equal(clients[0].view!.phase,'vote','no auto advance');
+  await send(0,'host:next');await send(0,'host:next');
+  const mafia=clients.findIndex(c=>c.view!.me.role==='mafia');
+  const doctor=clients.findIndex(c=>c.view!.me.role==='doctor');
+  const police=clients.findIndex(c=>c.view!.me.role==='police');
+  const target=clients[doctor].view!.me.id;
+  /** 능력이 없는 사람은 다음 → (1~5초 대기) → 다음 */
+  const tapTwice=async(i:number)=>{
+    await send(i,'night:next');
+    const ms=clients[i].view!.night!.tapReadyInMs!;
+    assert.ok(ms>=900&&ms<=5000,'second tap delay 1~5s');
+    assert.equal((await ack(clients[i].s,'night:next')).ok,false,'second tap too early');
+    await wait(ms+150);await send(i,'night:next');
+  };
+  const othersTap=(actor:number)=>Promise.all([0,1,2,3].filter(i=>i!==actor).map(tapTwice));
+  await send(mafia,'night:pick',target);
+  assert.equal(clients[police].view!.night!.myPick,null);
+  await send(mafia,'night:next');
+  assert.equal(clients[0].view!.night!.step,'mafia','waits for everyone');
+  await othersTap(mafia);
+  await send(doctor,'night:pick',target);await send(doctor,'night:next');await othersTap(doctor);
+  await send(police,'night:pick',clients[mafia].view!.me.id);await send(police,'night:next');await othersTap(police);
+  assert.ok(clients[police].view!.popup!.text.includes('마피아입니다'));
+  assert.equal(clients[0].view!.phase,'day');assert.equal(clients[doctor].view!.me.alive,true);
+  const c=clients[doctor];c.s.disconnect();c.s=io(URL,{transports:['websocket']});c.s.on('state',(v:GameView)=>c.view=v);
+  await wait(200);await send(doctor,'room:join',{code:created.code,name:'ignored',token:c.token});
+  assert.equal(c.view!.me.role,'doctor');
+  await send(0,'game:lobby');
+  console.log('✅ socket manual flow, privacy, no timers and reconnect passed');
+} finally {clients.forEach(c=>c.s.disconnect());}
